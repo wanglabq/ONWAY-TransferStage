@@ -18,3 +18,6 @@
 - **Keyboard Shortcuts**
   - Quick commands for homing, jogging, and setpoint changes
   - Customizable hotkeys
+ 
+For questions, feature requests, or contribution inquiries, please reach out to:  
+✉️ pengjiew@illinois.edu
