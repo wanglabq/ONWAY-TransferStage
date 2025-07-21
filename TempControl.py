@@ -22,7 +22,7 @@ UNIT_FONT = ("Arial", 32)          # was 30 → now 32
 ENTRY_FONT = ("Arial", 18)         # was 16 → now 18
 
 # Configuration
-SECRET_TOKEN = "Wanglabisestablishedon20240101inUIUCPHYSICS"
+SECRET_TOKEN = ###
 LOG_ENCODING = "utf-8-sig"
 PARAM_REG_ADDRESSES = {18506, 18507, 18508, 18509, 18523, 18501, 2036}
 
