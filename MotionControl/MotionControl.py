@@ -93,6 +93,25 @@ kb_enable = tk.BooleanVar(value=cfg.getboolean("General","keyboard_ctrl"), maste
 written_files = set()
 repeat_job = repeat_delta = None   # keyboard jog state
 
+
+# ---- Keyboard gating: user setting + temporary suspension during motion ----
+KEYS_SUSPENDED = False                                  # temporary lock
+
+def _keys_active() -> bool:
+    return kb_enable.get() and (not KEYS_SUSPENDED)
+
+def _suspend_keys(reason: str = "axis moving"):
+    global KEYS_SUSPENDED
+    if not KEYS_SUSPENDED:
+        KEYS_SUSPENDED = True
+        log(f"[KEYS] disabled ({reason})")
+
+def _resume_keys():
+    global KEYS_SUSPENDED
+    if KEYS_SUSPENDED:
+        KEYS_SUSPENDED = False
+        log("[KEYS] enabled")
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Utility
 # ─────────────────────────────────────────────────────────────────────────────
@@ -133,8 +152,27 @@ def _clamp_z(val: float) -> float:
 def pause():  _ok(sp.MoCtrCard_PauseAxisMov( System.Byte(255)))
 def resume(): _ok(sp.MoCtrCard_ReStartAxisMov(System.Byte(255)))
 def stop_axis(ax):
-    resume(); _ok(sp.MoCtrCard_StopAxisMov(System.Byte(ax)))
+    # stop the axis
+    resume()
+    _ok(sp.MoCtrCard_StopAxisMov(System.Byte(ax)))
+
+    # cancel any existing "to-target" poll and start a short settle poll
+    if _MOTION_POLL[ax] is not None:
+        try:
+            root.after_cancel(_MOTION_POLL[ax])
+        except Exception:
+            pass
+        _MOTION_POLL[ax] = None
+
+    # Start a no-target settle poll so UI keeps updating while the axis coasts to a stop.
+    # IMPORTANT: do NOT suspend keys for this settle.
+    _start_motion_poll(ax, target=None, suspend_keys=False)
+
+    # immediately re-enable keys for user control
+    _resume_keys()
+
     log(f"[STOP] {'RZ'[ax]} axis stopped.")
+
 
 def read_axis(ax):
     def _get(idx):
@@ -152,43 +190,48 @@ def read_axis(ax):
 def _confirm_param_change(ax: int, kind: str, new_val: float):
     """White dialog with black outline + green buttons."""
     _, cur_vel, cur_acc = read_axis(ax)
-    old_val = cur_vel if kind=='velocity' else cur_acc
+    old_val = cur_vel if kind == 'velocity' else cur_acc
 
     win = tk.Toplevel(root, bg=WHITE_BG, bd=1, relief="solid")
-    win.title("Confirm");  win.grab_set()
+    win.title("Confirm")
+    win.transient(root)
+    win.grab_set()
     if ICON_PATH and os.path.exists(ICON_PATH):
-        try: win.iconbitmap(ICON_PATH)
-        except Exception: pass
+        try:
+            win.iconbitmap(ICON_PATH)
+        except Exception:
+            pass
 
     msg = (f"Axis {AXES[ax]['lbl']} — {kind.capitalize()} \n\n"
            f"{old_val:.3f}  →  {new_val:.3f}\n")
-    tk.Label(win, text=msg, font=POP_FONT, bg=WHITE_BG)\
-        .pack(padx=30, pady=20)
+    tk.Label(win, text=msg, font=POP_FONT, bg=WHITE_BG).pack(padx=30, pady=20)
 
-    btn_fr = tk.Frame(win, bg=WHITE_BG); btn_fr.pack(pady=10)
-    for txt, cmd in (("CONFIRM", lambda:_apply_param(ax,kind,new_val)),
-                     ("CANCEL",  lambda:None)):
-        tk.Button(btn_fr, text=txt, width=8, **{
-            "bg": WHITE_BG, "fg": ACCENT_COLOR, "font": BTN_FONT,
-            "bd":1, "relief":"solid", "highlightthickness":1,
-            "highlightbackground":"#000000",
-            "command": lambda c=cmd: (c(), win.destroy())
-        }).pack(side=tk.LEFT, padx=8)
-
+    btn_fr = tk.Frame(win, bg=WHITE_BG)
+    btn_fr.pack(pady=10)
 
     def _do_confirm():
         _apply_param(ax, kind, new_val)
         win.destroy()
 
     def _do_cancel():
-        # restore entry box to the old value
         e = entry[ax][kind]
         e.delete(0, tk.END)
         e.insert(0, f"{old_val:.3f}")
         win.destroy()
 
-    tk.Button(btns, text="CONFIRM", width=10, command=_do_confirm).pack(side=tk.LEFT, padx=10)
-    tk.Button(btns, text="CANCEL",  width=10, command=_do_cancel ).pack(side=tk.LEFT, padx=10)
+    for txt, cmd in (("CONFIRM", _do_confirm), ("CANCEL", _do_cancel)):
+        tk.Button(
+            btn_fr, text=txt, width=10,
+            bg=WHITE_BG, fg=ACCENT_COLOR, font=BTN_FONT,
+            bd=1, relief="solid", highlightthickness=1, highlightbackground="#000000",
+            command=cmd
+        ).pack(side=tk.LEFT, padx=8)
+
+    # position near the main window and focus
+    win.update_idletasks()
+    win.geometry(f"+{root.winfo_rootx()+50}+{root.winfo_rooty()+50}")
+    win.focus_force()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Axis parameter callbacks
@@ -196,10 +239,15 @@ def _confirm_param_change(ax: int, kind: str, new_val: float):
 def _apply_param(ax, kind, val):
     idx = 2 if kind=='velocity' else 3
     stop_axis(ax)
-    if _ok(sp.MoCtrCard_SendPara(System.Byte(ax),System.Byte(idx),System.Single(val))):
+    if _ok(sp.MoCtrCard_SendPara(System.Byte(ax), System.Byte(idx), System.Single(val))):
         log(f"[{kind[:3].upper()}] Axis {AXES[ax]['lbl']} => {val:.3f} {AXES[ax][kind[0]+'unit']}")
+        if kind == 'velocity':
+            update_state(ax, vel=val, publish=True)
+        else:
+            update_state(ax, acc=val, publish=True)
     else:
         log(f"[{kind[:3].upper()}] Axis {AXES[ax]['lbl']} set FAILED")
+
 
 def on_enter(event, ax, kind):
     """User pressed <Return> in a velocity/acceleration box."""
@@ -216,38 +264,145 @@ def on_focus(evt, ax, kind, state): edit_flag[(ax,kind)] = state
 # ─────────────────────────────────────────────────────────────────────────────
 #  Motion commands
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  On-demand motion polling (runs ONLY during active motion)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MOTION_POLL = {0: None, 1: None}
+_LAST_POS    = {0: None, 1: None}
+_STILL_COUNT = {0: 0,    1: 0   }
+
+POS_EPS      = float(cfg.get("General", "pos_eps",          fallback="0.005"))   # to target
+DPOS_EPS     = float(cfg.get("General", "dpos_eps",         fallback="0.0015"))  # per tick delta
+STILL_N      = int(  cfg.get("General", "still_n",          fallback="3"))       # consecutive still ticks
+POLL_MS      = int(  cfg.get("General", "poll_ms",          fallback="50"))      # 20 Hz
+MOTION_TO_S  = float(cfg.get("General", "motion_timeout_s", fallback="30"))
+
+def _poll_until_settled(ax: int, target: float | None, t0: float):
+    try:
+        p, v, a = read_axis(ax)
+    except Exception:
+        p = v = a = None
+
+    # Update GUI/API/MQTT if changed
+    update_state(ax, pos=p, vel=v, acc=a, publish=True)
+
+    done = False
+    if p is not None:
+        if target is not None:
+            # known target (home/abs/rel): close to target, then still for a bit
+            close = abs(p - target) <= POS_EPS
+            if close:
+                if _LAST_POS[ax] is not None and abs(p - _LAST_POS[ax]) <= DPOS_EPS:
+                    _STILL_COUNT[ax] += 1
+                else:
+                    _STILL_COUNT[ax] = 0
+            else:
+                _STILL_COUNT[ax] = 0
+            done = _STILL_COUNT[ax] >= STILL_N
+        else:
+            # unknown target (jog): rely on stillness
+            if _LAST_POS[ax] is not None and abs(p - _LAST_POS[ax]) <= DPOS_EPS:
+                _STILL_COUNT[ax] += 1
+            else:
+                _STILL_COUNT[ax] = 0
+            done = _STILL_COUNT[ax] >= STILL_N
+
+        _LAST_POS[ax] = p
+
+    if (time.time() - t0) > MOTION_TO_S:
+        log(f"[POLL] Axis {AXES[ax]['lbl']} timed out while waiting to settle")
+        done = True
+
+    if not done:
+        _MOTION_POLL[ax] = root.after(POLL_MS, lambda: _poll_until_settled(ax, target, t0))
+        return
+
+    # finished
+    _MOTION_POLL[ax] = None
+    _STILL_COUNT[ax] = 0
+    _resume_keys()   # re-enable keyboard control now that motion is done
+
+
+def _start_motion_poll(ax: int, target: float | None, *, suspend_keys: bool = True):
+    # optionally suspend key control for the duration of this motion
+    if suspend_keys:
+        _suspend_keys("axis moving")
+
+    if _MOTION_POLL[ax] is not None:
+        try:
+            root.after_cancel(_MOTION_POLL[ax])
+        except Exception:
+            pass
+        _MOTION_POLL[ax] = None
+
+    _LAST_POS[ax] = None
+    _STILL_COUNT[ax] = 0
+    _MOTION_POLL[ax] = root.after(
+        POLL_MS, lambda: _poll_until_settled(ax, target, time.time())
+    )
+
+
+
 def move_abs(ax):
-    txt = abs_inp[ax].get().strip() or "0"                   
-    try: val = float(abs_inp[ax].get())
-    except ValueError: return log(f"[ABS] bad input for {AXES[ax]['lbl']}")
-    if ax == 1:                         # Z-axis clamps
-        if val != _clamp_z(val):
+    txt = abs_inp[ax].get().strip() or "0"
+    try:
+        val = float(txt)
+    except ValueError:
+        log(f"[ABS] bad input for {AXES[ax]['lbl']}")
+        return
+
+    # Clamp Z if needed
+    if ax == 1:
+        clamped = _clamp_z(val)
+        if clamped != val:
             log("[ABS] Z target capped to range 0–17 mm")
-        val = _clamp_z(val)
+        val = clamped
+
+    target = val  # define the target explicitly (used by the poller)
+
     resume()
-    if _ok(sp.MoCtrCard_MCrlAxisAbsMove(System.Byte(ax),System.Single(val))):
-        log(f"[ABS] Axis {AXES[ax]['lbl']} => {val:.3f} {AXES[ax]['unit']}")
+    if _ok(sp.MoCtrCard_MCrlAxisAbsMove(System.Byte(ax), System.Single(target))):
+        log(f"[ABS] Axis {AXES[ax]['lbl']} => {target:.3f} {AXES[ax]['unit']}")
+        _start_motion_poll(ax, target)  # keep UI/MQTT updating until motion settles
+    else:
+        log(f"[ABS] Axis {AXES[ax]['lbl']} ABS FAILED")
+
+
 def move_rel(ax, sgn):
-    txt = rel_inp[ax].get().strip() or "0"   
-    try: step = float(rel_inp[ax].get())*sgn
-    except ValueError: return log(f"[REL] bad input for {AXES[ax]['lbl']}")
-    pos,_,_ = read_axis(ax)
-    if ax == 1:                         
-        target = _clamp_z(pos + step)
-        if target != pos + step:
+    txt = rel_inp[ax].get().strip() or "0"
+    try:
+        step = float(txt) * sgn
+    except ValueError:
+        return log(f"[REL] bad input for {AXES[ax]['lbl']}")
+
+    pos, _, _ = read_axis(ax)                 # one-time read for target
+    target = pos + step                       # default target for all axes
+
+    if ax == 1:
+        clamped = _clamp_z(target)            # clamp Z only
+        if clamped != target:
             log("[REL] Z move limited to 0–17 mm")
-        step = target - pos
+        target = clamped
+        step = target - pos                   # recompute step after clamp
+
     resume()
-    if _ok(sp.MoCtrCard_MCrlAxisRelMove(System.Byte(ax),System.Single(step))):
+    if _ok(sp.MoCtrCard_MCrlAxisRelMove(System.Byte(ax), System.Single(step))):
         log(f"[REL] Axis {AXES[ax]['lbl']} move {step:+.3f} {AXES[ax]['unit']}")
+        _start_motion_poll(ax, target)        # <-- target is always defined now
+    else:
+        log(f"[REL] Axis {AXES[ax]['lbl']} REL FAILED")
+
 
 def home(ax: int):
-    """Send axis R (0) or Z (1) straight to 0.0, regardless of GUI fields."""
-    resume()  # be sure the controller isn’t paused
-    if _ok(sp.MoCtrCard_MCrlAxisAbsMove(System.Byte(ax), System.Single(0.0))):
-        log(f"[HOME] Axis {AXES[ax]['lbl']} => 0.000 {AXES[ax]['unit']}")
+    target = 0.0
+    resume()
+    if _ok(sp.MoCtrCard_MCrlAxisAbsMove(System.Byte(ax), System.Single(target))):
+        log(f"[HOME] Axis {AXES[ax]['lbl']} => {target:.3f} {AXES[ax]['unit']}")
+        _start_motion_poll(ax, target)
     else:
         log(f"[HOME] Axis {AXES[ax]['lbl']} HOME FAILED")
+
 
 def set_defaults():
     for ax,d in AXES.items():
@@ -255,26 +410,7 @@ def set_defaults():
             entry[ax][kind].delete(0,tk.END); entry[ax][kind].insert(0,str(val))
             _apply_param(ax,kind,val)
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  GUI refresh / API sync
-# ─────────────────────────────────────────────────────────────────────────────
-def refresh():
-    for ax in AXES:
-        pos,vel,acc = read_axis(ax)
-        if pos_disp[ax]:
-            pos_disp[ax].config(state='normal'); pos_disp[ax].delete(0,tk.END)
-            pos_disp[ax].insert(0,f"{pos:.3f}"); pos_disp[ax].config(state='readonly')
-        if not edit_flag[(ax,'velocity')]:
-            e=entry[ax]['velocity']; e.delete(0,tk.END); e.insert(0,f"{vel:.3f}")
-        if not edit_flag[(ax,'acceleration')]:
-            e=entry[ax]['acceleration']; e.delete(0,tk.END); e.insert(0,f"{acc:.3f}")
-        prefix = 'r_' if ax==0 else 'z_'
-        api_state[prefix+'position'], api_state[prefix+'velocity'], api_state[prefix+'acceleration'] = pos,vel,acc
-    if mqtt_mgr:                          # send telemetry if MQTT is active
-        mqtt_mgr.publish({k: round(v, 3) for k, v in api_state.items()})
 
-
-    root.after(gi("General", "refresh_ms"), refresh)
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Keyboard jog
@@ -291,19 +427,22 @@ _LIMIT_EPS = 0.01
 
 def _guard_z_limit():
     global _z_job, _z_dir
-    if _z_dir == 0:        
+    if _z_dir == 0:
         _z_job = None
         return
 
-    pos, _, _ = read_axis(1) 
+    pos, _, _ = read_axis(1)                      # 20 Hz while *actively jogging*
+    update_state(1, pos=pos, publish=True)        # GUI/MQTT only when it changes
+
     if (_z_dir > 0 and pos >= Z_MAX - _LIMIT_EPS) or \
        (_z_dir < 0 and pos <= Z_MIN + _LIMIT_EPS):
-        _stop_jog(1)       
+        _stop_jog(1)
         _z_dir = 0
         _z_job = None
         return
 
-    _z_job = root.after(50, _guard_z_limit)   
+    _z_job = root.after(50, _guard_z_limit)
+
 
 keys_held = set()    
 # ------------------------------------------------------------------
@@ -437,7 +576,6 @@ def _stop_jog(ax: int):
 
 # --- incremental-step helper (for the old 6 shortcuts) -----------------------
 def _z_step(delta_mm: float):
-    """Single relative move on the Z axis, clamped to 0–17 mm."""
     if delta_mm == 0:
         return
     pos, _, _ = read_axis(1)
@@ -448,67 +586,163 @@ def _z_step(delta_mm: float):
     resume()
     if _ok(sp.MoCtrCard_MCrlAxisRelMove(System.Byte(1), System.Single(delta))):
         log(f"[STEP] Z => {'UP' if delta > 0 else 'DOWN'} {abs(delta):.3f} mm")
+        update_state(1, pos=pos + delta, publish=True)       # optimistic
+        root.after(150, lambda: update_state(1, readback=True))
+
 
 def key_down(event):
-    if not kb_enable.get():
+    if not _keys_active():
         return None
+
     key = event.keysym
     if key in keys_held:          # ignore auto-repeat
         return "break"
+
+    # modifiers
     shift = bool(event.state & 0x0001)
     ctrl  = bool(event.state & 0x0004)
     alt   = bool((event.state & 0x0008) or (event.state & 0x20000))
-    # --- legacy fine‑step shortcuts  ➜  now tap‑OR‑hold ------------------
-    # --- combo keys: tap = step, hold = continuous --------------------------
+
+    # --- fine-step shortcuts (tap = step; hold = jog only for ±0.025) ----
     step = None
+    # 0.001 / 0.010 via NumLock + modifiers (single-step only, no hold jog)
     if key.lower() == "num_lock":
         if shift and ctrl and alt:   step = -0.001
         elif shift and alt:          step = -0.010
         elif ctrl  and alt:          step = +0.001
         elif alt:                    step = +0.010
+    # 0.025 via Ctrl + '.' or ',' (tap = step, hold = jog)
     elif key == "period" and ctrl:   step = +0.025
     elif key == "comma"  and ctrl:   step = -0.025
 
     if step is not None:
-        keys_held.add(key)           # track press
-        press_info[key] = {'step': step, 'started': False}
-        # schedule the hold‑action; if key is released before it fires,
-        # key_up() will cancel it and treat as tap
-        press_info[key]['job'] = root.after(
-            TAP_MS, lambda k=key: _begin_hold_jog(k))
+        keys_held.add(key)
+        # allow continuous jog ONLY for ±0.025
+        allow_hold = abs(step) == 0.025
+        press_info[key] = {'step': step, 'started': False, 'job': None}
+        if allow_hold:
+            press_info[key]['job'] = root.after(TAP_MS, lambda k=key: _begin_hold_jog(k))
         return "break"
 
+    # --- arrow jogging: change Shift+Arrow -> Ctrl+Arrow (minimal change) ---
+    if ctrl and key == "Up":
+        _start_jog(1, +1, ctrl)   # keep using modifier to pick slow/fast profile
+        keys_held.add("Up")
+        return "break"
+    elif ctrl and key == "Down":
+        _start_jog(1, -1, ctrl)
+        keys_held.add("Down")
+        return "break"
 
-    if key == "Up":
-        _start_jog(1, +1, shift); keys_held.add("Up")
-    elif key == "Down":
-        _start_jog(1, -1, shift); keys_held.add("Down")
-    
-    #elif key == "Right":
-    #    _start_jog(0, +1, shift); keys_held.add("Right")
-    #elif key == "Left":
-    #    _start_jog(0, -1, shift); keys_held.add("Left")
-    #elif key == "space" and shift and ctrl and alt:
-    #    stop_axis(0); stop_axis(1)        # emergency stop
     return "break"
+
+
 def key_up(event):
-    key = event.keysym
-    if key not in keys_held:
+    if not _keys_active():
         return None
+    key = event.keysym
+    if key not in keys_held and key not in press_info:
+        return None
+
+    # stop Z jog on arrow key release
     if key in ("Up", "Down"):
         _stop_jog(1)
-    elif key in ("Left", "Right"):
-        _stop_jog(0)
-    elif key in press_info:
+        keys_held.discard(key)
+        return "break"
+
+    # handle tap/hold logic for the step keys
+    if key in press_info:
         info = press_info.pop(key)
-        # if jog never started, it was a quick tap → single step
-        if not info['started']:
-            root.after_cancel(info['job'])
+        if not info['started']:      # quick tap => single step
+            job = info.get('job')
+            if job is not None:
+                try:
+                    root.after_cancel(job)
+                except Exception:
+                    pass
             _z_step(info['step'])
         else:
-            _stop_jog(1)             # continuous jog: stop on release
+            # hold started => continuous jog; stop on release
+            _stop_jog(1)
+
     keys_held.discard(key)
     return "break"
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Event-driven GUI / API updates (no periodic refresh loop)
+# ─────────────────────────────────────────────────────────────────────────────
+# Local cache to avoid redundant GUI/MQTT churn
+_state_cache = {
+    0: {"pos": None, "vel": None, "acc": None},   # R axis
+    1: {"pos": None, "vel": None, "acc": None},   # Z axis
+}
+_EPS_POS = float(cfg.get("General", "eps_pos", fallback="0.001"))
+_EPS_VEL = float(cfg.get("General", "eps_vel", fallback="0.01"))
+_EPS_ACC = float(cfg.get("General", "eps_acc", fallback="0.01"))
+
+def _ne(a, b, eps):
+    return (a is None) or (b is None) or (abs(a - b) > eps)
+
+def _push_mqtt_if_changed():
+    if not mqtt_mgr:
+        return
+    mqtt_mgr.publish({k: round(v, 3) for k, v in api_state.items()})
+
+def _update_gui_field(entry_widget, value_str, *, readonly=False):
+    if not entry_widget:
+        return
+    if readonly:
+        entry_widget.config(state='normal')
+    if entry_widget.get() != value_str:
+        entry_widget.delete(0, tk.END)
+        entry_widget.insert(0, value_str)
+    if readonly:
+        entry_widget.config(state='readonly')
+
+def update_state(ax: int, *, pos=None, vel=None, acc=None, readback=False, publish=True):
+    """
+    Event-driven state update:
+      • If readback=True  -> read once from controller and use that.
+      • Else -> trust provided pos/vel/acc (from ABS/REL/JOG/param change).
+      • Only updates GUI + api_state + MQTT when values actually changed.
+    """
+    if readback:
+        try:
+            p, v, a = read_axis(ax)
+        except Exception:
+            p = v = a = None
+    else:
+        p, v, a = pos, vel, acc
+
+    changed = False
+    cur = _state_cache[ax]
+    prefix = 'r_' if ax == 0 else 'z_'
+
+    if p is not None and _ne(p, cur["pos"], _EPS_POS):
+        cur["pos"] = p
+        api_state[prefix + 'position'] = p
+        if pos_disp.get(ax):
+            _update_gui_field(pos_disp[ax], f"{p:.3f}", readonly=True)
+        changed = True
+
+    if v is not None and _ne(v, cur["vel"], _EPS_VEL):
+        cur["vel"] = v
+        api_state[prefix + 'velocity'] = v
+        if not edit_flag[(ax, 'velocity')]:
+            _update_gui_field(entry[ax]['velocity'], f"{v:.3f}")
+        changed = True
+
+    if a is not None and _ne(a, cur["acc"], _EPS_ACC):
+        cur["acc"] = a
+        api_state[prefix + 'acceleration'] = a
+        if not edit_flag[(ax, 'acceleration')]:
+            _update_gui_field(entry[ax]['acceleration'], f"{a:.3f}")
+        changed = True
+
+    if changed and publish:
+        _push_mqtt_if_changed()
 
 
 # Bind the handlers
@@ -707,6 +941,85 @@ for ax in AXES: axis_frame(left,ax)
 settings=tk.LabelFrame(left,text="Settings",font=("Arial",14,'bold'),bg=WHITE_BG,bd=3)
 settings.pack(fill='x')
 top=tk.Frame(settings,bg=WHITE_BG); top.pack(fill='x',pady=5)
+# ------------------------------------------------------------------
+#  Helper for the green “Connect” button
+# ------------------------------------------------------------------
+def _connect_clicked():
+    if _ok(sp.MoCtrCard_Initial(com_var.get())):
+        log("✅ Initialized")
+
+        # Read once from controller for both axes and update GUI/API/MQTT
+        try:
+            update_state(0, readback=True, publish=True)  # R
+        except Exception as e:
+            log(f"[INIT] Failed to read R: {e}")
+        try:
+            update_state(1, readback=True, publish=True)  # Z
+        except Exception as e:
+            log(f"[INIT] Failed to read Z: {e}")
+
+        if MQTT_ENABLED:
+            global mqtt_mgr
+            if mqtt_mgr is None:
+                mqtt_mgr = MQTTManager(root)
+    else:
+        log("❌ Init failed")
+
+# ── Settings top row  (all white, green-outline buttons) ────────────
+std_btn = dict(
+    bg=WHITE_BG, fg=ACCENT_COLOR, font=BTN_FONT,
+    bd=1, relief="solid", highlightthickness=1, highlightbackground="#000000"
+)
+
+com_var = tk.StringVar(value=cfg["General"]["com_port"])
+# ── Settings top row  (white bg, thin black outline, green text) ──
+std_btn = dict(bg=WHITE_BG, fg=ACCENT_COLOR, font=BTN_FONT,
+               bd=1, relief="solid", highlightthickness=1,
+               highlightbackground="#000000")
+
+com_var = tk.StringVar(value=cfg["General"]["com_port"])
+
+tk.Button(top, text="Connect", **std_btn, command=_connect_clicked)\
+   .pack(side=tk.LEFT, padx=6)
+tk.Button(top, text="Default", **std_btn, command=set_defaults)\
+   .pack(side=tk.LEFT, padx=6)
+tk.Button(top, text="Configuration", **std_btn,
+          command=show_config_dialog)\
+   .pack(side=tk.LEFT, padx=6)
+
+# Right-side log view
+log_frame = tk.Frame(root, bg=WHITE_BG, bd=1, relief="solid")
+log_frame.pack(side=tk.RIGHT, fill="both", expand=True, padx=5, pady=5)
+
+log_box = tk.Text(log_frame, state=tk.DISABLED, width=48,
+                  font=("Consolas",10), bg=WHITE_BG, relief="flat")
+log_box.pack(fill="both", expand=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Main loop & shutdown
+# ─────────────────────────────────────────────────────────────────────────────
+#root.bind("<KeyPress>",  key_down)
+#root.bind("<KeyRelease>",key_up)
+# ---- start global keyboard hook ----------------------------------
+keyboard.hook(_global_press)          # fires for both down & up
+keyboard.hook(_global_release)
+threading.Thread(target=keyboard.wait, daemon=True).start()
+
+if use_api.get(): threading.Thread(target=start_api,daemon=True).start()
+
+def on_close():
+    try:
+        sp.MoCtrCard_Unload()
+    finally:
+        if mqtt_mgr:                    # stop MQTT loop nicely
+            mqtt_mgr.stop()
+        root.quit()
+        root.destroy()
+        os._exit(0)
+
+root.protocol("WM_DELETE_WINDOW", on_close)
+root.mainloop()
 # ------------------------------------------------------------------
 #  Helper for the green “Connect” button
 # ------------------------------------------------------------------
