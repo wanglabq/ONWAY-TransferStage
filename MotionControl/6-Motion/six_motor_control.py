@@ -668,7 +668,23 @@ def _joystick_loop():
         log_message(f"[JOY] JS1: {js1.get_name()} → A/B/C")
 
     x_dir = y_dir = a_dir = b_dir = c_dir = 0
-    BUTTON_MAP = {
+
+    # JS0 (Xbox 360) button map → (axis, step, sign)
+    # Fine steps (±0.001): btn2=X+, btn3=X−, btn5=Y+, btn4=Y−
+    # Coarse steps (±0.005): btn0=X+, btn1=X−, btn9=Y+, btn8=Y−
+    JS0_BUTTON_MAP = {
+        2: (0, 0.001, +1),   # X + 0.001
+        3: (0, 0.001, -1),   # X - 0.001
+        5: (1, 0.001, +1),   # Y + 0.001
+        4: (1, 0.001, -1),   # Y - 0.001
+        0: (0, 0.005, +1),   # X + 0.005
+        1: (0, 0.005, -1),   # X - 0.005
+        9: (1, 0.005, +1),   # Y + 0.005
+        8: (1, 0.005, -1),   # Y - 0.005
+    }
+
+    # JS1 (T.16000M) button map → (axis, step, sign)
+    JS1_BUTTON_MAP = {
         4:(3,0.025,+1), 9:(3,0.025,-1),
         5:(4,0.025,+1), 8:(4,0.025,-1),
         6:(5,0.025,+1), 7:(5,0.025,-1),
@@ -711,9 +727,20 @@ def _joystick_loop():
                     val = evt.value
                     new_c = int(val/abs(val)) if abs(val) > DEADZONE else 0
                     if new_c != c_dir: _cont_axis(5, new_c); c_dir = new_c
+            elif evt.type == pygame.JOYBUTTONDOWN and evt.joy == 0:
+                # Xbox controller buttons → X/Y relative moves
+                if evt.button in JS0_BUTTON_MAP:
+                    ax, step, sgn = JS0_BUTTON_MAP[evt.button]
+                    delta = step * sgn
+                    _rel_move_ts[ax] = time.monotonic()
+                    root.after(0, lambda a=ax, s=step: (
+                        rel_input_widgets[a].delete(0, tk.END),
+                        rel_input_widgets[a].insert(0, f"{s}"),
+                    ))
+                    _move_rel_direct(ax, delta)
             elif evt.type == pygame.JOYBUTTONDOWN and evt.joy == 1:
-                if evt.button in BUTTON_MAP:
-                    ax, step, sgn = BUTTON_MAP[evt.button]
+                if evt.button in JS1_BUTTON_MAP:
+                    ax, step, sgn = JS1_BUTTON_MAP[evt.button]
                     delta = step * sgn
                     _rel_move_ts[ax] = time.monotonic()
                     # Update the UI widget so the displayed value stays in sync,
