@@ -101,24 +101,23 @@ def check_token():
     return tok == SECRET_TOKEN if tok else True
 
 # --- Modbus read/write with retry & scaling ---
-def read_register(cli, address, slave=10, retries=5):
+def read_register(cli, address, device_id=10, retries=5):
     try:
         for _ in range(retries):
-            rsp = cli.read_holding_registers(address, count=1, slave=slave)
+            rsp = cli.read_holding_registers(address, count=1, device_id=device_id)
             if not rsp.isError():
                 val = rsp.registers[0] / 10
-                return val * 10 if address in [2036, 18523, 2092,
-                                               18506, 18507, 18508,
-                                               18509, 18501] else val
+                return val * 10 if address in [2036, 18523, 2092, 18506, 18507, 18508, 18509, 18501] else val
             time.sleep(0.1)
     except SerialException as e:
         print("[Modbus] serial error:", e)
     return None
-def write_register(client, address, value, slave=10):
+
+def write_register(client, address, value, device_id=10):
     # these registers need the /10 before writing
     if address in [18506, 18507, 18508, 18509, 18523, 18501, 2036]:
         value = value / 10
-    client.write_register(address, int(value * 10), slave=slave)
+    client.write_register(address, int(value * 10), device_id=device_id)
 
 # --- Timestamp & CSV logging ---
 def _timestamp_parts():
