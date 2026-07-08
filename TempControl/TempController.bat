@@ -1,4 +1,4 @@
 @echo off
-cd /d "C:\Users\WangLabAdmin\Desktop\Pearl_copy\Temp"
-".venv\Scripts\python.exe" "TempControl(Test).py"
+cd /d "%~dp0"
+".venv\Scripts\python.exe" "TempControl_MQTT_LongHistory.py"
 pause

@@ -199,7 +199,6 @@ class MQTTManager:
                  gui_ref=None, device_type="onway",
                  device_id="", device_name="",
                  manufacturer="", model="",
-                 entity_prefix_name="",
                  publish_interval=1.0,
                  expire_after=300,
                  history_topic=""):
@@ -222,7 +221,6 @@ class MQTTManager:
         self.device_name = device_name or self._cfg_get("Device", "name", self.device_id)
         self.manufacturer = manufacturer or self._cfg_get("Device", "manufacturer", "")
         self.model = model or self._cfg_get("Device", "model", "")
-        self.entity_prefix_name = entity_prefix_name or self._default_entity_prefix()
         self.publish_interval = max(0.0, float(publish_interval or 0.0))
         self.expire_after = int(expire_after or 0)
         self.history_topic = str(history_topic or "").strip().rstrip("/")
@@ -268,13 +266,6 @@ class MQTTManager:
             text = text.split(",", 1)[0].strip()
         text = re.sub(r"[^A-Za-z0-9_-]+", "_", text)
         return text.strip("_") or "controller"
-
-    def _default_entity_prefix(self):
-        if self.device_type == "furnace":
-            return "Furnace"
-        if self.device_type == "onway":
-            return "Onway"
-        return "Controller"
 
     def _device_info(self):
         info = {
@@ -369,7 +360,7 @@ class MQTTManager:
             object_id = f"{self.device_id}_{self._sanitize_id(field).lower()}"
             topic = f"{self.discovery_prefix}/sensor/{object_id}/config"
             payload = {
-                "name": f"{self.entity_prefix_name} {conf['name']}",
+                "name": f"{conf['name']}",
                 "state_topic": self.topic_pub,
                 "value_template": conf.get("template") or f"{{{{ value_json.{field} }}}}",
                 "unique_id": object_id,
@@ -399,7 +390,7 @@ class MQTTManager:
 
         number_topic = f"{self.discovery_prefix}/number/{self.device_id}_setpoint/config"
         number_payload = {
-            "name": f"{self.entity_prefix_name} Setpoint",
+            "name": f"Setpoint",
             "state_topic": self.topic_pub,
             "command_topic": self.setpoint_cmd_topic,
             "command_template": '{"Setpoint": {{ value | float }} }',
@@ -1056,7 +1047,6 @@ class TemperatureControlApp:
             device_name = self.cfg.get("Device", "name", fallback="Onway Temperature Controller"),
             manufacturer = self.cfg.get("Device", "manufacturer", fallback="ONWAY"),
             model = self.cfg.get("Device", "model", fallback="OTC-9600"),
-            entity_prefix_name = self.cfg.get("MQTT", "entity_prefix_name", fallback="Onway"),
             publish_interval = self.cfg.getfloat("MQTT", "publish_interval_sec", fallback=1.0),
             expire_after = self.cfg.getint("MQTT", "expire_after", fallback=300),
             history_topic = self.cfg["MQTT"].get("history_topic", ""),
