@@ -20,7 +20,8 @@ from serial import SerialException
 # ──────────────────────────────────────────────────────────────
 #  Global configuration -- everything now comes from INI
 # ──────────────────────────────────────────────────────────────
-CFG_PATH = os.path.join(os.path.dirname(__file__), "TempConfig.ini")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CFG_PATH = os.path.join(SCRIPT_DIR, "TempConfig.ini")
 
 
 cfg = configparser.ConfigParser()
@@ -43,7 +44,29 @@ BIG_FONT        = ("Arial", BIG_FONT_SIZE,  "bold")
 UNIT_FONT       = ("Arial", UNIT_FONT_SIZE)
 ENTRY_FONT      = ("Arial", ENTRY_FONT_SIZE)
 
-ICON_PATH = cfg.get("UI", "icon_path", fallback="")
+ICON_PATH = cfg.get("UI", "icon_path", fallback="").strip()
+if ICON_PATH and not os.path.isabs(ICON_PATH):
+    ICON_PATH = os.path.join(SCRIPT_DIR, ICON_PATH)
+
+def apply_window_icon(window):
+    if not ICON_PATH:
+        return
+    if not os.path.exists(ICON_PATH):
+        print(f"[UI] icon not found: {ICON_PATH}")
+        return
+    try:
+        window.iconbitmap(ICON_PATH)
+    except tk.TclError as e:
+        print(f"[UI] icon error: {e}")
+
+def set_windows_app_id():
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("wanglab.transfer_star.temp_controller")
+    except Exception as e:
+        print(f"[UI] app id error: {e}")
 
 # ---- serial / Modbus ----  (section renamed to [Serial] in INI)
 SERIAL_OPTS = {
@@ -597,11 +620,7 @@ class TemperatureControlApp:
         self.master = master
         self.master.title("ONWAY TEMPERATURE CONTROLLER")
         self.master.geometry("900x370")
-        if ICON_PATH and os.path.exists(ICON_PATH):
-            try:
-                self.master.iconbitmap(ICON_PATH)
-            except Exception:
-                pass           # ignore if .ico not valid for this platform
+        apply_window_icon(self.master)
 
         # state & threads
         self.client = None
@@ -636,9 +655,7 @@ class TemperatureControlApp:
         dlg = tk.Toplevel(self.master, bg="#FFFFFF")
         dlg.title("Configuration")
         dlg.transient(self.master); dlg.grab_set()
-        if ICON_PATH and os.path.exists(ICON_PATH):
-            try: dlg.iconbitmap(ICON_PATH)
-            except Exception: pass
+        apply_window_icon(dlg)
 
         # vars
         com_var  = tk.StringVar(value=self.com_var.get())
@@ -1081,7 +1098,8 @@ class TemperatureControlApp:
 ### CHANGED: No other modifications
 
 if __name__ == "__main__":
+    set_windows_app_id()
     root = tk.Tk()
-    gui_app = TemperatureControlApp(root)       # ← GOOD: keeps names distinct
+    gui_app = TemperatureControlApp(root)
     root.protocol("WM_DELETE_WINDOW", gui_app.close)
     root.mainloop()
