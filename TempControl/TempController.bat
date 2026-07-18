@@ -1,4 +1,4 @@
 @echo off
 cd /d "%~dp0"
-python "TempControl_MQTT_LongHistory.py"
+"C:\Users\WangLabAdmin\AppData\Local\Programs\Python\Python313-32\python.exe" "TempControl_MQTT_LongHistory.py"
 pause
