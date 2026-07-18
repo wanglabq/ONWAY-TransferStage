@@ -20,7 +20,8 @@ from serial import SerialException
 # ──────────────────────────────────────────────────────────────
 #  Global configuration -- everything now comes from INI
 # ──────────────────────────────────────────────────────────────
-CFG_PATH = os.path.join(os.path.dirname(__file__), "TempConfig.ini")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CFG_PATH = os.path.join(SCRIPT_DIR, "TempConfig.ini")
 
 
 cfg = configparser.ConfigParser()
@@ -43,7 +44,29 @@ BIG_FONT        = ("Arial", BIG_FONT_SIZE,  "bold")
 UNIT_FONT       = ("Arial", UNIT_FONT_SIZE)
 ENTRY_FONT      = ("Arial", ENTRY_FONT_SIZE)
 
-ICON_PATH = cfg.get("UI", "icon_path", fallback="")
+ICON_PATH = cfg.get("UI", "icon_path", fallback="").strip()
+if ICON_PATH and not os.path.isabs(ICON_PATH):
+    ICON_PATH = os.path.join(SCRIPT_DIR, ICON_PATH)
+
+def apply_window_icon(window):
+    if not ICON_PATH:
+        return
+    if not os.path.exists(ICON_PATH):
+        print(f"[UI] icon not found: {ICON_PATH}")
+        return
+    try:
+        window.iconbitmap(ICON_PATH)
+    except tk.TclError as e:
+        print(f"[UI] icon error: {e}")
+
+def set_windows_app_id():
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("wanglab.transfer_pearl.temp_controller")
+    except Exception as e:
+        print(f"[UI] app id error: {e}")
 
 # ---- serial / Modbus ----  (section renamed to [Serial] in INI)
 SERIAL_OPTS = {
@@ -78,24 +101,23 @@ def check_token():
     return tok == SECRET_TOKEN if tok else True
 
 # --- Modbus read/write with retry & scaling ---
-def read_register(cli, address, slave=10, retries=5):
+def read_register(cli, address, device_id=10, retries=5):
     try:
         for _ in range(retries):
-            rsp = cli.read_holding_registers(address, count=1, slave=slave)
+            rsp = cli.read_holding_registers(address, count=1, device_id=device_id)
             if not rsp.isError():
                 val = rsp.registers[0] / 10
-                return val * 10 if address in [2036, 18523, 2092,
-                                               18506, 18507, 18508,
-                                               18509, 18501] else val
+                return val * 10 if address in [2036, 18523, 2092, 18506, 18507, 18508, 18509, 18501] else val
             time.sleep(0.1)
     except SerialException as e:
         print("[Modbus] serial error:", e)
     return None
-def write_register(client, address, value, slave=10):
+
+def write_register(client, address, value, device_id=10):
     # these registers need the /10 before writing
     if address in [18506, 18507, 18508, 18509, 18523, 18501, 2036]:
         value = value / 10
-    client.write_register(address, int(value * 10), slave=slave)
+    client.write_register(address, int(value * 10), device_id=device_id)
 
 # --- Timestamp & CSV logging ---
 def _timestamp_parts():
@@ -199,7 +221,6 @@ class MQTTManager:
                  gui_ref=None, device_type="onway",
                  device_id="", device_name="",
                  manufacturer="", model="",
-                 entity_prefix_name="",
                  publish_interval=1.0,
                  expire_after=300,
                  history_topic=""):
@@ -222,7 +243,6 @@ class MQTTManager:
         self.device_name = device_name or self._cfg_get("Device", "name", self.device_id)
         self.manufacturer = manufacturer or self._cfg_get("Device", "manufacturer", "")
         self.model = model or self._cfg_get("Device", "model", "")
-        self.entity_prefix_name = entity_prefix_name or self._default_entity_prefix()
         self.publish_interval = max(0.0, float(publish_interval or 0.0))
         self.expire_after = int(expire_after or 0)
         self.history_topic = str(history_topic or "").strip().rstrip("/")
@@ -268,13 +288,6 @@ class MQTTManager:
             text = text.split(",", 1)[0].strip()
         text = re.sub(r"[^A-Za-z0-9_-]+", "_", text)
         return text.strip("_") or "controller"
-
-    def _default_entity_prefix(self):
-        if self.device_type == "furnace":
-            return "Furnace"
-        if self.device_type == "onway":
-            return "Onway"
-        return "Controller"
 
     def _device_info(self):
         info = {
@@ -369,7 +382,7 @@ class MQTTManager:
             object_id = f"{self.device_id}_{self._sanitize_id(field).lower()}"
             topic = f"{self.discovery_prefix}/sensor/{object_id}/config"
             payload = {
-                "name": f"{self.entity_prefix_name} {conf['name']}",
+                "name": f"{conf['name']}",
                 "state_topic": self.topic_pub,
                 "value_template": conf.get("template") or f"{{{{ value_json.{field} }}}}",
                 "unique_id": object_id,
@@ -399,7 +412,7 @@ class MQTTManager:
 
         number_topic = f"{self.discovery_prefix}/number/{self.device_id}_setpoint/config"
         number_payload = {
-            "name": f"{self.entity_prefix_name} Setpoint",
+            "name": f"Setpoint",
             "state_topic": self.topic_pub,
             "command_topic": self.setpoint_cmd_topic,
             "command_template": '{"Setpoint": {{ value | float }} }',
@@ -606,11 +619,7 @@ class TemperatureControlApp:
         self.master = master
         self.master.title("ONWAY TEMPERATURE CONTROLLER")
         self.master.geometry("900x370")
-        if ICON_PATH and os.path.exists(ICON_PATH):
-            try:
-                self.master.iconbitmap(ICON_PATH)
-            except Exception:
-                pass           # ignore if .ico not valid for this platform
+        apply_window_icon(self.master)
 
         # state & threads
         self.client = None
@@ -645,9 +654,7 @@ class TemperatureControlApp:
         dlg = tk.Toplevel(self.master, bg="#FFFFFF")
         dlg.title("Configuration")
         dlg.transient(self.master); dlg.grab_set()
-        if ICON_PATH and os.path.exists(ICON_PATH):
-            try: dlg.iconbitmap(ICON_PATH)
-            except Exception: pass
+        apply_window_icon(dlg)
 
         # vars
         com_var  = tk.StringVar(value=self.com_var.get())
@@ -1056,7 +1063,6 @@ class TemperatureControlApp:
             device_name = self.cfg.get("Device", "name", fallback="Onway Temperature Controller"),
             manufacturer = self.cfg.get("Device", "manufacturer", fallback="ONWAY"),
             model = self.cfg.get("Device", "model", fallback="OTC-9600"),
-            entity_prefix_name = self.cfg.get("MQTT", "entity_prefix_name", fallback="Onway"),
             publish_interval = self.cfg.getfloat("MQTT", "publish_interval_sec", fallback=1.0),
             expire_after = self.cfg.getint("MQTT", "expire_after", fallback=300),
             history_topic = self.cfg["MQTT"].get("history_topic", ""),
@@ -1091,7 +1097,8 @@ class TemperatureControlApp:
 ### CHANGED: No other modifications
 
 if __name__ == "__main__":
+    set_windows_app_id()
     root = tk.Tk()
-    gui_app = TemperatureControlApp(root)       # ← GOOD: keeps names distinct
+    gui_app = TemperatureControlApp(root)
     root.protocol("WM_DELETE_WINDOW", gui_app.close)
     root.mainloop()
