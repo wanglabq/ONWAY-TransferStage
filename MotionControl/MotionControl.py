@@ -14,16 +14,21 @@ import json
 
 
 # ─── load INI ───────────────────────────────────────────────────────────
-INI_PATH = os.path.join(os.path.dirname(__file__), "MotionConfig.ini")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+INI_PATH = os.path.join(SCRIPT_DIR, "MotionConfig.ini")
 cfg = configparser.ConfigParser()
 if not cfg.read(INI_PATH, encoding="utf-8"):
     raise FileNotFoundError(f"Cannot read {INI_PATH}")
 
 gi = cfg.getint; gf = cfg.getfloat; gs = cfg.get    # short-hand
 
-DLL_PATH = gs("Paths", "dll_path")
-LOG_ROOT = gs("Paths", "log_root")
+DLL_PATH = gs("Paths", "dll_path").strip()
+if DLL_PATH and not os.path.isabs(DLL_PATH):
+    DLL_PATH = os.path.join(SCRIPT_DIR, DLL_PATH)
+
+LOG_ROOT = gs("Paths", "log_root").strip()
 LOG_ENCODING = cfg.get("Logging", "encoding", fallback="utf-8")
+
 Z_MIN = gf("Z_Limits", "min")
 Z_MAX = gf("Z_Limits", "max")
 
@@ -44,11 +49,29 @@ JOG = {
 }
 
 MQTT_ENABLED = cfg.getboolean("MQTT","enabled",fallback=False)
+DEVICE_ID = gs("Device", "identifiers").strip()
+DEVICE_NAME = gs("Device", "name").strip()
+DEVICE_MANUFACTURER = gs("Device", "manufacturer").strip()
+DEVICE_MODEL = gs("Device", "model").strip()
+
+MQTT_HOST = gs("MQTT", "host").strip()
+MQTT_PORT = gi("MQTT", "port")
+MQTT_TOPIC = gs("MQTT", "topic").strip().rstrip("/")
+MQTT_USERNAME = gs("MQTT", "username").strip()
+MQTT_PASSWORD = gs("MQTT", "password")
+MQTT_CLIENT_ID = gs("MQTT", "client_id").strip()
+MQTT_DISCOVERY_PREFIX = gs("MQTT", "discovery_prefix").strip().rstrip("/")
+MQTT_QOS = gi("MQTT", "qos")
+MQTT_RETAIN = cfg.getboolean("MQTT", "retain")
+MQTT_HISTORY_TOPIC = gs("MQTT", "history_topic").strip().rstrip("/")
+MQTT_AVAILABILITY_TOPIC = f"{MQTT_TOPIC}/availability"
 ACCENT_COLOR = "#2E7D32"      # same fresh green
 WHITE_BG     = "#FFFFFF"
 BTN_FONT     = ("Arial", 12)  # tweak size here
 POP_FONT     = ("Arial", 10)
-ICON_PATH = cfg.get("UI", "icon_path", fallback="")
+ICON_PATH = cfg.get("UI", "icon_path", fallback="").strip()
+if ICON_PATH and not os.path.isabs(ICON_PATH):
+    ICON_PATH = os.path.join(SCRIPT_DIR, ICON_PATH)
 
 
 clr.AddReference(DLL_PATH)
@@ -753,66 +776,69 @@ def update_state(ax: int, *, pos=None, vel=None, acc=None, readback=False, publi
 # ─────────────────────────────────────────────────────────────────────────
 class MQTTManager:
     def __init__(self, gui):
-        self.gui   = gui
+        self.gui = gui
         if not MQTT_ENABLED:
             self.client = None
             return
-        self.topic = cfg["MQTT"]["topic"]
-        self.qos   = cfg.getint("MQTT","qos",fallback=0)
-        self.retain= cfg.getboolean("MQTT","retain",fallback=False)
 
-        self.client = mqtt.Client(client_id=cfg["MQTT"].get("client_id") or
-                                               f"Motion_{os.getpid()}")
-        user = cfg["MQTT"].get("username","")
-        if user:
-            self.client.username_pw_set(user, cfg["MQTT"].get("password",""))
+        self.topic = MQTT_TOPIC
+        self.qos = MQTT_QOS
+        self.retain = MQTT_RETAIN
+        self.history_topic = MQTT_HISTORY_TOPIC
+        self.availability_topic = MQTT_AVAILABILITY_TOPIC
+
+        self.client = mqtt.Client(client_id=MQTT_CLIENT_ID)
+        if MQTT_USERNAME:
+            self.client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+        self.client.will_set(self.availability_topic, payload="offline", qos=self.qos, retain=True)
         self.client.on_connect = self._on_connect
-        self.client.connect(cfg["MQTT"]["host"], cfg.getint("MQTT","port"))
+        self.client.connect(MQTT_HOST, MQTT_PORT)
         self.client.loop_start()
-        self.publish_discovery()
 
-    # ---------- discovery on first connect ----------
     def _on_connect(self, client, userdata, flags, rc, *_):
-        print("[MQTT] connected") if rc==0 else print("[MQTT] rc",rc)
-        if rc==0:
+        print("[MQTT] connected") if rc == 0 else print("[MQTT] rc", rc)
+        if rc == 0:
+            self.client.publish(self.availability_topic, "online", qos=self.qos, retain=True)
             self.publish_discovery()
 
     def publish_discovery(self):
-        prefix = cfg["MQTT"].get("discovery_prefix","homeassistant").rstrip('/')
         device = {
-            "identifiers":  ["onway_motion"],
-            "name":         "Onway Motion Controller",
-            "manufacturer": "ONWAY",
-            "model":        "MCC-4",
+            "identifiers": [DEVICE_ID],
+            "name": DEVICE_NAME,
+            "manufacturer": DEVICE_MANUFACTURER,
+            "model": DEVICE_MODEL,
         }
-        for axis,label in ((0,'r'),(1,'z')):
-            for key in ("position","velocity","acceleration"):
-                uid   = f"onway_{label}_{key}"
-                topic = f"{prefix}/sensor/{uid}/config"
+        for axis, label in ((0, "r"), (1, "z")):
+            axis_name = AXES[axis]["lbl"]
+            for key in ("position", "velocity", "acceleration"):
+                uid = f"{DEVICE_ID}_{label}_{key}"
+                topic = f"{MQTT_DISCOVERY_PREFIX}/sensor/{uid}/config"
                 payload = {
-                    "name": f"Onway {label.upper()} {key}",
+                    "name": f"{axis_name}_{key}",
                     "state_topic": self.topic,
                     "value_template": f"{{{{ value_json.{label}_{key} }}}}",
                     "unique_id": uid,
-                    "unit_of_measurement": AXES[axis]['unit' if key=="position" else
-                                                                ('vunit' if key=="velocity" else 'aunit')],
-                    "device_class": None,
-                    "device": device
+                    "unit_of_measurement": AXES[axis]["unit" if key == "position" else ("vunit" if key == "velocity" else "aunit")],
+                    "state_class": "measurement",
+                    "availability_topic": self.availability_topic,
+                    "payload_available": "online",
+                    "payload_not_available": "offline",
+                    "device": device,
                 }
-                self.client.publish(topic,
-                    json.dumps(payload, ensure_ascii=False),
-                    retain=True)
+                self.client.publish(topic, json.dumps(payload, ensure_ascii=False), qos=self.qos, retain=True)
 
-
-    # ---------- publish telemetry ----------
     def publish(self, js_obj):
         if self.client:
-            self.client.publish(self.topic, json.dumps(js_obj),
-                                qos=self.qos, retain=self.retain)
+            text = json.dumps(js_obj, ensure_ascii=False)
+            self.client.publish(self.topic, text, qos=self.qos, retain=self.retain)
+            if self.history_topic:
+                self.client.publish(self.history_topic, text, qos=self.qos, retain=False)
 
     def stop(self):
         if self.client:
-            self.client.loop_stop(); self.client.disconnect()
+            self.client.publish(self.availability_topic, "offline", qos=self.qos, retain=True)
+            self.client.loop_stop()
+            self.client.disconnect()
 
 mqtt_mgr = None
 
@@ -1001,75 +1027,6 @@ log_box.pack(fill="both", expand=True)
 # ─────────────────────────────────────────────────────────────────────────────
 #root.bind("<KeyPress>",  key_down)
 #root.bind("<KeyRelease>",key_up)
-# ---- start global keyboard hook ----------------------------------
-keyboard.hook(_global_press)          # fires for both down & up
-keyboard.hook(_global_release)
-threading.Thread(target=keyboard.wait, daemon=True).start()
-
-if use_api.get(): threading.Thread(target=start_api,daemon=True).start()
-
-def on_close():
-    try:
-        sp.MoCtrCard_Unload()
-    finally:
-        if mqtt_mgr:                    # stop MQTT loop nicely
-            mqtt_mgr.stop()
-        root.quit()
-        root.destroy()
-        os._exit(0)
-
-root.protocol("WM_DELETE_WINDOW", on_close)
-root.mainloop()
-# ------------------------------------------------------------------
-#  Helper for the green “Connect” button
-# ------------------------------------------------------------------
-def _connect_clicked():
-    if _ok(sp.MoCtrCard_Initial(com_var.get())):
-        log("✅ Initialized")
-        if MQTT_ENABLED:
-            global mqtt_mgr
-            if mqtt_mgr is None:
-                mqtt_mgr = MQTTManager(root)
-    else:
-        log("❌ Init failed")
-
-# ── Settings top row  (all white, green-outline buttons) ────────────
-std_btn = dict(
-    bg=WHITE_BG, fg=ACCENT_COLOR, font=BTN_FONT,
-    bd=1, relief="solid", highlightthickness=1, highlightbackground="#000000"
-)
-
-com_var = tk.StringVar(value=cfg["General"]["com_port"])
-# ── Settings top row  (white bg, thin black outline, green text) ──
-std_btn = dict(bg=WHITE_BG, fg=ACCENT_COLOR, font=BTN_FONT,
-               bd=1, relief="solid", highlightthickness=1,
-               highlightbackground="#000000")
-
-com_var = tk.StringVar(value=cfg["General"]["com_port"])
-
-tk.Button(top, text="Connect", **std_btn, command=_connect_clicked)\
-   .pack(side=tk.LEFT, padx=6)
-tk.Button(top, text="Default", **std_btn, command=set_defaults)\
-   .pack(side=tk.LEFT, padx=6)
-tk.Button(top, text="Configuration", **std_btn,
-          command=show_config_dialog)\
-   .pack(side=tk.LEFT, padx=6)
-
-# Right-side log view
-log_frame = tk.Frame(root, bg=WHITE_BG, bd=1, relief="solid")
-log_frame.pack(side=tk.RIGHT, fill="both", expand=True, padx=5, pady=5)
-
-log_box = tk.Text(log_frame, state=tk.DISABLED, width=48,
-                  font=("Consolas",10), bg=WHITE_BG, relief="flat")
-log_box.pack(fill="both", expand=True)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Main loop & shutdown
-# ─────────────────────────────────────────────────────────────────────────────
-#root.bind("<KeyPress>",  key_down)
-#root.bind("<KeyRelease>",key_up)
-root.after(gi("General","refresh_ms"), refresh)
 # ---- start global keyboard hook ----------------------------------
 keyboard.hook(_global_press)          # fires for both down & up
 keyboard.hook(_global_release)
